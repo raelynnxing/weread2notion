@@ -11,8 +11,9 @@ from http.cookies import SimpleCookie
 from datetime import datetime
 import hashlib
 from dotenv import load_dotenv
-import os
 from retrying import retry
+
+# 导入工具函数（保持原有不变）
 from utils import (
     get_callout,
     get_date,
@@ -28,6 +29,8 @@ from utils import (
     get_title,
     get_url,
 )
+
+# 加载环境变量（保持原有不变）
 load_dotenv()
 WEREAD_URL = "https://weread.qq.com/"
 WEREAD_NOTEBOOKS_URL = "https://weread.qq.com/api/user/notebook"
@@ -37,6 +40,8 @@ WEREAD_READ_INFO_URL = "https://weread.qq.com/web/book/readinfo"
 WEREAD_REVIEW_LIST_URL = "https://weread.qq.com/web/review/list"
 WEREAD_BOOK_INFO = "https://weread.qq.com/web/book/info"
 
+# 全局变量：存储 data_source_id（新增）
+DATA_SOURCE_ID = ""
 
 def parse_cookie_string(cookie_string):
     cookie = SimpleCookie()
@@ -58,7 +63,6 @@ def get_bookmark_list(bookId):
     params = dict(bookId=bookId)
     r = session.get(WEREAD_BOOKMARKLIST_URL, params=params)
     if r.ok:
-        print(r.json())
         updated = r.json().get("updated")
         updated = sorted(
             updated,
@@ -105,16 +109,29 @@ def get_review_list(bookId):
     reviews = list(map(lambda x: {**x, "markText": x.pop("content")}, reviews))
     return summary, reviews
 
-
 def check(bookId):
-    """检查是否已经插入过 如果已经插入了就删除"""
+    """检查是否已经插入过 如果已经插入了就删除（适配2025-09-03 API）"""
+    global DATA_SOURCE_ID
     filter = {"property": "BookId", "rich_text": {"equals": bookId}}
-    response = client.databases.query(database_id=database_id, filter=filter)
-    for result in response["results"]:
-        try:
-            client.blocks.delete(block_id=result["id"])
-        except Exception as e:
-            print(f"删除块时出错: {e}")
+    headers = {
+        "Authorization": f"Bearer {os.getenv('NOTION_TOKEN')}",
+        "Notion-Version": "2025-09-03",
+        "Content-Type": "application/json"
+    }
+    # 调用新的 data_sources 查询端点
+    response = requests.patch(
+        f"https://api.notion.com/v1/data_sources/{DATA_SOURCE_ID}/query",
+        headers=headers,
+        json={"filter": filter}
+    )
+    if response.ok:
+        for result in response.json()["results"]:
+            try:
+                client.blocks.delete(block_id=result["id"])
+            except Exception as e:
+                print(f"删除块时出错: {e}")
+    else:
+        print(f"查询已有页面失败：{response.text}")
 
 @retry(stop_max_attempt_number=3, wait_fixed=5000,retry_on_exception=refresh_token)
 def get_chapter_info(bookId):
@@ -132,12 +149,13 @@ def get_chapter_info(bookId):
         return {item["chapterUid"]: item for item in update}
     return None
 
-
 def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, categories):
-    """插入到notion"""
+    """插入到notion（适配2025-09-03 API，用data_source_id作为父级）"""
+    global DATA_SOURCE_ID
     if not cover or not cover.startswith("http"):
         cover = "https://www.notion.so/icons/book_gray.svg"
-    parent = {"database_id": database_id, "type": "database_id"}
+    # 关键修改：parent 从 database_id 改为 data_source_id
+    parent = {"data_source_id": DATA_SOURCE_ID, "type": "data_source_id"}
     properties = {
         "BookName": get_title(bookName),
         "BookId": get_rich_text(bookId),
@@ -173,13 +191,11 @@ def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, catego
                     "%Y-%m-%d %H:%M:%S"
                 )
             )
-
     icon = get_icon(cover)
     # notion api 限制100个block
-    response = client.pages.create(parent=parent, icon=icon,cover=icon, properties=properties)
+    response = client.pages.create(parent=parent, icon=icon, cover=icon, properties=properties)
     id = response["id"]
     return id
-
 
 def add_children(id, children):
     results = []
@@ -191,13 +207,11 @@ def add_children(id, children):
         results.extend(response.get("results"))
     return results if len(results) == len(children) else None
 
-
 def add_grandchild(grandchild, results):
     for key, value in grandchild.items():
         time.sleep(0.3)
         id = results[key].get("id")
         client.blocks.children.append(block_id=id, children=[value])
-
 
 def get_notebooklist():
     """获取笔记本列表"""
@@ -212,9 +226,9 @@ def get_notebooklist():
         print(r.text)
     return None
 
-
 def get_sort():
-    """获取database中的最新时间"""
+    """获取数据源中的最新排序（适配2025-09-03 API）"""
+    global DATA_SOURCE_ID
     filter = {"property": "Sort", "number": {"is_not_empty": True}}
     sorts = [
         {
@@ -222,13 +236,22 @@ def get_sort():
             "direction": "descending",
         }
     ]
-    response = client.databases.query(
-        database_id=database_id, filter=filter, sorts=sorts, page_size=1
+    headers = {
+        "Authorization": f"Bearer {os.getenv('NOTION_TOKEN')}",
+        "Notion-Version": "2025-09-03",
+        "Content-Type": "application/json"
+    }
+    # 调用新的 data_sources 查询端点
+    response = requests.patch(
+        f"https://api.notion.com/v1/data_sources/{DATA_SOURCE_ID}/query",
+        headers=headers,
+        json={"filter": filter, "sorts": sorts, "page_size": 1}
     )
-    if len(response.get("results")) == 1:
-        return response.get("results")[0].get("properties").get("Sort").get("number")
+    if response.ok:
+        results = response.json().get("results", [])
+        if len(results) == 1:
+            return results[0].get("properties", {}).get("Sort", {}).get("number", 0)
     return 0
-
 
 def get_children(chapter, summary, bookmark_list):
     children = []
@@ -264,7 +287,6 @@ def get_children(chapter, summary, bookmark_list):
                 if i.get("abstract") != None and i.get("abstract") != "":
                     quote = get_quote(i.get("abstract"))
                     grandchild[len(children) - 1] = quote
-
     else:
         # 如果没有章节信息
         for data in bookmark_list:
@@ -293,21 +315,17 @@ def get_children(chapter, summary, bookmark_list):
                 )
     return children, grandchild
 
-
 def transform_id(book_id):
     id_length = len(book_id)
-
     if re.match("^\d*$", book_id):
         ary = []
         for i in range(0, id_length, 9):
             ary.append(format(int(book_id[i : min(i + 9, id_length)]), "x"))
         return "3", ary
-
     result = ""
     for i in range(id_length):
         result += format(ord(book_id[i]), "x")
     return "4", [result]
-
 
 def calculate_book_str_id(book_id):
     md5 = hashlib.md5()
@@ -316,25 +334,19 @@ def calculate_book_str_id(book_id):
     result = digest[0:3]
     code, transformed_ids = transform_id(book_id)
     result += code + "2" + digest[-2:]
-
     for i in range(len(transformed_ids)):
         hex_length_str = format(len(transformed_ids[i]), "x")
         if len(hex_length_str) == 1:
             hex_length_str = "0" + hex_length_str
-
         result += hex_length_str + transformed_ids[i]
-
         if i < len(transformed_ids) - 1:
             result += "g"
-
     if len(result) < 20:
         result += digest[0 : 20 - len(result)]
-
     md5 = hashlib.md5()
     md5.update(result.encode("utf-8"))
     result += md5.hexdigest()[0:3]
     return result
-
 
 def try_get_cloud_cookie(url, id, password):
     if url.endswith("/"):
@@ -354,7 +366,6 @@ def try_get_cloud_cookie(url, id, password):
             result = cookie_str
     return result
 
-
 def get_cookie():
     url = os.getenv("CC_URL")
     if not url:
@@ -367,8 +378,6 @@ def get_cookie():
     if not cookie or not cookie.strip():
         raise Exception("没有找到cookie，请按照文档填写cookie")
     return cookie
-    
-
 
 def extract_page_id():
     url = os.getenv("NOTION_PAGE")
@@ -386,16 +395,40 @@ def extract_page_id():
     else:
         raise Exception(f"获取NotionID失败，请检查输入的Url是否正确")
 
+def get_data_source_id(database_id):
+    """新增：获取数据库对应的 data_source_id（适配2025-09-03 API）"""
+    headers = {
+        "Authorization": f"Bearer {os.getenv('NOTION_TOKEN')}",
+        "Notion-Version": "2025-09-03"
+    }
+    response = requests.get(
+        f"https://api.notion.com/v1/databases/{database_id}",
+        headers=headers
+    )
+    if response.ok:
+        data_sources = response.json().get("data_sources", [])
+        if len(data_sources) == 0:
+            raise Exception("该数据库没有数据源，请先在Notion中创建数据源")
+        return data_sources[0]["id"]  # 取第一个数据源（默认情况）
+    raise Exception(f"获取 data_source_id 失败：{response.status_code} - {response.text}")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     options = parser.parse_args()
     weread_cookie = get_cookie()
     database_id = extract_page_id()
     notion_token = os.getenv("NOTION_TOKEN")
+    
+    # 新增：获取 data_source_id 并赋值给全局变量
+    DATA_SOURCE_ID = get_data_source_id(database_id)
+    print(f"成功获取 data_source_id：{DATA_SOURCE_ID}")
+    
+    # 初始化 session 和 client（保持原有不变）
     session = requests.Session()
     session.cookies = parse_cookie_string(weread_cookie)
     client = Client(auth=notion_token, log_level=logging.ERROR)
     session.get(WEREAD_URL)
+    
     latest_sort = get_sort()
     books = get_notebooklist()
     if books != None:
