@@ -54,7 +54,9 @@ def parse_cookie_string(cookie_string):
     return cookiejar
 
 def refresh_token(exception):
+    """修复：添加返回值，让retrying库能判断是否重试"""
     session.get(WEREAD_URL)
+    return True  # 关键：返回True表示需要重试
 
 @retry(stop_max_attempt_number=3, wait_fixed=5000,retry_on_exception=refresh_token)
 def get_bookmark_list(bookId):
@@ -110,7 +112,7 @@ def get_review_list(bookId):
     return summary, reviews
 
 def check(bookId):
-    """检查是否已经插入过 如果已经插入了就删除（适配2025-09-03 API）"""
+    """检查是否已经插入过 如果已经插入了就删除（修复：请求方式改为POST）"""
     global DATA_SOURCE_ID
     filter = {"property": "BookId", "rich_text": {"equals": bookId}}
     headers = {
@@ -118,8 +120,8 @@ def check(bookId):
         "Notion-Version": "2025-09-03",
         "Content-Type": "application/json"
     }
-    # 调用新的 data_sources 查询端点
-    response = requests.patch(
+    # 关键修复：PATCH → POST，端点路径正确
+    response = requests.post(
         f"https://api.notion.com/v1/data_sources/{DATA_SOURCE_ID}/query",
         headers=headers,
         json={"filter": filter}
@@ -227,7 +229,7 @@ def get_notebooklist():
     return None
 
 def get_sort():
-    """获取数据源中的最新排序（适配2025-09-03 API）"""
+    """获取数据源中的最新排序（修复：请求方式改为POST）"""
     global DATA_SOURCE_ID
     filter = {"property": "Sort", "number": {"is_not_empty": True}}
     sorts = [
@@ -241,8 +243,8 @@ def get_sort():
         "Notion-Version": "2025-09-03",
         "Content-Type": "application/json"
     }
-    # 调用新的 data_sources 查询端点
-    response = requests.patch(
+    # 关键修复：PATCH → POST，端点路径正确
+    response = requests.post(
         f"https://api.notion.com/v1/data_sources/{DATA_SOURCE_ID}/query",
         headers=headers,
         json={"filter": filter, "sorts": sorts, "page_size": 1}
