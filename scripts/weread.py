@@ -60,18 +60,22 @@ def refresh_token(exception):
 
 @retry(stop_max_attempt_number=3, wait_fixed=5000,retry_on_exception=refresh_token)
 def get_bookmark_list(bookId):
-    """获取我的划线"""
+    """获取我的划线（修复：增加空值判断，避免迭代None）"""
     session.get(WEREAD_URL)
     params = dict(bookId=bookId)
     r = session.get(WEREAD_BOOKMARKLIST_URL, params=params)
     if r.ok:
-        updated = r.json().get("updated")
+        # 关键修复：先判断updated是否存在且不为None，否则返回空列表
+        updated = r.json().get("updated", [])
+        if updated is None:
+            updated = []
+        # 排序前先确认是可迭代对象
         updated = sorted(
             updated,
-            key=lambda x: (x.get("chapterUid", 1), int(x.get("range").split("-")[0])),
+            key=lambda x: (x.get("chapterUid", 1), int(x.get("range").split("-")[0]) if x.get("range") else 0),
         )
-        return r.json()["updated"]
-    return None
+        return updated
+    return []  # 非200响应也返回空列表，避免后续报错
 
 @retry(stop_max_attempt_number=3, wait_fixed=5000,retry_on_exception=refresh_token)
 def get_read_info(bookId):
@@ -100,15 +104,20 @@ def get_bookinfo(bookId):
 
 @retry(stop_max_attempt_number=3, wait_fixed=5000,retry_on_exception=refresh_token)
 def get_review_list(bookId):
-    """获取笔记"""
+    """获取笔记（修复：增加空值容错）"""
     session.get(WEREAD_URL)
     params = dict(bookId=bookId, listType=11, mine=1, syncKey=0)
     r = session.get(WEREAD_REVIEW_LIST_URL, params=params)
-    reviews = r.json().get("reviews")
-    summary = list(filter(lambda x: x.get("review").get("type") == 4, reviews))
-    reviews = list(filter(lambda x: x.get("review").get("type") == 1, reviews))
-    reviews = list(map(lambda x: x.get("review"), reviews))
-    reviews = list(map(lambda x: {**x, "markText": x.pop("content")}, reviews))
+    # 容错：响应非200或无reviews字段时返回空列表
+    if not r.ok:
+        return [], []
+    reviews = r.json().get("reviews", [])
+    if reviews is None:
+        reviews = []
+    summary = list(filter(lambda x: x.get("review", {}).get("type") == 4, reviews))
+    reviews = list(filter(lambda x: x.get("review", {}).get("type") == 1, reviews))
+    reviews = list(map(lambda x: x.get("review", {}), reviews))
+    reviews = list(map(lambda x: {**x, "markText": x.pop("content")} if x else {}, reviews))
     return summary, reviews
 
 def check(bookId):
@@ -137,19 +146,24 @@ def check(bookId):
 
 @retry(stop_max_attempt_number=3, wait_fixed=5000,retry_on_exception=refresh_token)
 def get_chapter_info(bookId):
-    """获取章节信息"""
+    """获取章节信息（修复：增加空值容错）"""
     session.get(WEREAD_URL)
     body = {"bookIds": [bookId], "synckeys": [0], "teenmode": 0}
     r = session.post(WEREAD_CHAPTER_INFO, json=body)
+    # 容错：响应异常时返回空字典
+    if not r.ok:
+        return {}
+    data = r.json()
     if (
-        r.ok
-        and "data" in r.json()
-        and len(r.json()["data"]) == 1
-        and "updated" in r.json()["data"][0]
+        "data" not in data
+        or len(data["data"]) != 1
+        or "updated" not in data["data"][0]
     ):
-        update = r.json()["data"][0]["updated"]
-        return {item["chapterUid"]: item for item in update}
-    return None
+        return {}
+    update = data["data"][0]["updated"]
+    if update is None:
+        update = []
+    return {item["chapterUid"]: item for item in update}
 
 def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, categories):
     """插入到notion（适配2025-09-03 API，用data_source_id作为父级）"""
@@ -221,7 +235,9 @@ def get_notebooklist():
     r = session.get(WEREAD_NOTEBOOKS_URL)
     if r.ok:
         data = r.json()
-        books = data.get("books")
+        books = data.get("books", [])
+        if books is None:
+            books = []
         books.sort(key=lambda x: x["sort"])
         return books
     else:
@@ -258,7 +274,10 @@ def get_sort():
 def get_children(chapter, summary, bookmark_list):
     children = []
     grandchild = {}
-    if chapter != None:
+    # 容错：bookmark_list为None时赋值为空列表
+    if bookmark_list is None:
+        bookmark_list = []
+    if chapter != None and chapter != {}:
         # 添加目录
         children.append(get_table_of_contents())
         d = {}
@@ -276,7 +295,7 @@ def get_children(chapter, summary, bookmark_list):
                     )
                 )
             for i in value:
-                markText = i.get("markText")
+                markText = i.get("markText", "")
                 for j in range(0, len(markText) // 2000 + 1):
                     children.append(
                         get_callout(
@@ -292,7 +311,7 @@ def get_children(chapter, summary, bookmark_list):
     else:
         # 如果没有章节信息
         for data in bookmark_list:
-            markText = data.get("markText")
+            markText = data.get("markText", "")
             for i in range(0, len(markText) // 2000 + 1):
                 children.append(
                     get_callout(
@@ -302,17 +321,20 @@ def get_children(chapter, summary, bookmark_list):
                         data.get("reviewId"),
                     )
                 )
-    if summary != None and len(summary) > 0:
+    # 容错：summary为None时赋值为空列表
+    if summary is None:
+        summary = []
+    if len(summary) > 0:
         children.append(get_heading(1, "点评"))
         for i in summary:
-            content = i.get("review").get("content")
+            content = i.get("review", {}).get("content", "")
             for j in range(0, len(content) // 2000 + 1):
                 children.append(
                     get_callout(
                         content[j * 2000 : (j + 1) * 2000],
                         i.get("style"),
                         i.get("colorStyle"),
-                        i.get("review").get("reviewId"),
+                        i.get("review", {}).get("reviewId"),
                     )
                 )
     return children, grandchild
@@ -433,44 +455,57 @@ if __name__ == "__main__":
     
     latest_sort = get_sort()
     books = get_notebooklist()
-    if books != None:
+    if books != None and len(books) > 0:
         for index, book in enumerate(books):
-            sort = book["sort"]
-            if sort <= latest_sort:
-                continue
-            book = book.get("book")
-            title = book.get("title")
-            cover = book.get("cover").replace("/s_", "/t7_")
-            bookId = book.get("bookId")
-            author = book.get("author")
-            categories = book.get("categories")
-            if categories != None:
-                categories = [x["title"] for x in categories]
-            print(f"正在同步 {title} ,一共{len(books)}本，当前是第{index+1}本。")
-            check(bookId)
-            isbn, rating = get_bookinfo(bookId)
-            id = insert_to_notion(
-                title, bookId, cover, sort, author, isbn, rating, categories
-            )
-            chapter = get_chapter_info(bookId)
-            bookmark_list = get_bookmark_list(bookId)
-            summary, reviews = get_review_list(bookId)
-            bookmark_list.extend(reviews)
-            bookmark_list = sorted(
-                bookmark_list,
-                key=lambda x: (
-                    x.get("chapterUid", 1),
-                    (
-                        0
-                        if (
-                            x.get("range", "") == ""
-                            or x.get("range").split("-")[0] == ""
-                        )
-                        else int(x.get("range").split("-")[0])
+            # 批量同步容错：单本书出错不终止，跳过继续同步下一本
+            try:
+                sort = book["sort"]
+                if sort <= latest_sort:
+                    continue
+                book = book.get("book", {})
+                title = book.get("title", "未知书籍")
+                cover = book.get("cover", "").replace("/s_", "/t7_")
+                bookId = book.get("bookId", "")
+                author = book.get("author", "")
+                categories = book.get("categories")
+                if categories != None:
+                    categories = [x["title"] for x in categories]
+                print(f"正在同步 {title} ,一共{len(books)}本，当前是第{index+1}本。")
+                
+                # 跳过bookId为空的异常书籍
+                if not bookId:
+                    print(f"跳过：{title} 的bookId为空")
+                    continue
+                
+                check(bookId)
+                isbn, rating = get_bookinfo(bookId)
+                id = insert_to_notion(
+                    title, bookId, cover, sort, author, isbn, rating, categories
+                )
+                chapter = get_chapter_info(bookId)
+                bookmark_list = get_bookmark_list(bookId)
+                summary, reviews = get_review_list(bookId)
+                bookmark_list.extend(reviews)
+                bookmark_list = sorted(
+                    bookmark_list,
+                    key=lambda x: (
+                        x.get("chapterUid", 1),
+                        (
+                            0
+                            if (
+                                x.get("range", "") == ""
+                                or x.get("range").split("-")[0] == ""
+                            )
+                            else int(x.get("range").split("-")[0])
+                        ),
                     ),
-                ),
-            )
-            children, grandchild = get_children(chapter, summary, bookmark_list)
-            results = add_children(id, children)
-            if len(grandchild) > 0 and results != None:
-                add_grandchild(grandchild, results)
+                )
+                children, grandchild = get_children(chapter, summary, bookmark_list)
+                results = add_children(id, children)
+                if len(grandchild) > 0 and results != None:
+                    add_grandchild(grandchild, results)
+            except Exception as e:
+                print(f"同步第{index+1}本书 {title} 时出错：{str(e)}，跳过继续下一本")
+                continue
+    else:
+        print("没有找到需要同步的书籍")
